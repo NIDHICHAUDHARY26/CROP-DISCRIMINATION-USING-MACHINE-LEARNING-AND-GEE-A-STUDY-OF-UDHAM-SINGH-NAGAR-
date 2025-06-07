@@ -1,0 +1,1273 @@
+//code....//
+
+
+// ADD SHAPEFILE
+Map.centerObject(aoi, 10);
+Map.addLayer(aoi, {color: 'blue'}, 'My Shapefile');
+
+Map.addLayer(sugarcane)
+Map.centerObject(sugarcane)
+Map.addLayer(rice, {color:'brown'})
+
+var water = water.map(function(feature) { return feature.set('class', 0); });
+var settlements = settlements.map(function(feature) { return feature.set('class', 1); });
+var forest = forest.map(function(feature) { return feature.set('class', 2); });
+var bareland = bareland.map(function(feature) { return feature.set('class', 3); });
+var rice = rice.map(function(feature) { return feature.set('class', 4); });
+var sugarcane = sugarcane.map(function(feature) { return feature.set('class', 5); });
+
+var trainingSamples = water.merge(settlements)
+  .merge(forest)
+  .merge(bareland)
+  .merge(rice)
+  .merge(sugarcane);
+
+var months = ['06', '07', '08', '09', '10'];
+var monthNames = ['June', 'July', 'August', 'September', 'October'];
+
+months.forEach(function(month, index) {
+  var startDate = '2023-' + month + '-01';
+  var endDate = '2023-' + month + '-30';
+
+  // Sentinel-2 
+  var sentinel2 = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+    .filterBounds(aoi)
+    .filterDate(startDate, endDate)
+    .filter(ee.Filter.lte("CLOUDY_PIXEL_PERCENTAGE", 30))
+    .select(['B2', 'B3', 'B4', 'B8', 'B11', 'B12'])
+    .median()
+    .clip(aoi);
+    
+  // Calculate NDVI, EVI, NDBI
+  var ndvi = sentinel2.normalizedDifference(['B8', 'B4']).rename('NDVI');
+  var evi = sentinel2.expression(
+    '2.5 * ((NIR - RED) / (NIR + 6 * RED - 7.5 * BLUE + 1))', {
+      'NIR': sentinel2.select('B8'),
+      'RED': sentinel2.select('B4'),
+      'BLUE': sentinel2.select('B2')
+    }).rename('EVI');
+  var ndbi = sentinel2.normalizedDifference(['B11', 'B8']).rename('NDBI');
+
+  Map.addLayer(ndvi, {min: -1, max: 1, palette: ['blue', 'white', 'green']}, 'NDVI - ' + monthNames[index]);
+  Map.addLayer(evi, {min: -1, max: 1, palette: ['blue', 'white', 'green']}, 'EVI - ' + monthNames[index]);
+  Map.addLayer(ndbi, {min: -1, max: 1, palette: ['white', 'brown', 'black']}, 'NDBI - ' + monthNames[index]);
+
+  var ndviMean = ndvi.reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry: aoi,
+    scale: 10,
+    maxPixels: 1e13
+  }).get('NDVI');
+
+  var eviMean = evi.reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry: aoi,
+    scale: 10,
+    maxPixels: 1e13
+  }).get('EVI');
+
+  var ndbiMean = ndbi.reduceRegion({
+    reducer: ee.Reducer.mean(), 
+    geometry: aoi,
+    scale: 10,
+    maxPixels: 1e13
+  }).get('NDBI');
+
+  // NDVI, EVI, NDBI values for each month
+  print('Mean NDVI for ' + monthNames[index] + ':', ndviMean);
+  print('Mean EVI for ' + monthNames[index] + ':', eviMean);
+  print('Mean NDBI for ' + monthNames[index] + ':', ndbiMean);
+
+  // Sample for training/testing
+  var training = sentinel2.sampleRegions({
+    collection: trainingSamples,
+    properties: ['class'],
+    scale: 10
+  });
+
+  var withRandom = training.randomColumn('random');
+  var split = 0.7;
+  var trainSet = withRandom.filter(ee.Filter.lt('random', split));
+  var testSet = withRandom.filter(ee.Filter.gte('random', split));
+
+  // Train classifiers
+  var rf = ee.Classifier.smileRandomForest(50).train({
+    features: trainSet,
+    classProperty: 'class',
+    inputProperties: sentinel2.bandNames()
+  });
+
+  var svm = ee.Classifier.libsvm().train({
+    features: trainSet,
+    classProperty: 'class',
+    inputProperties: sentinel2.bandNames()
+  });
+
+  var knn = ee.Classifier.smileKNN(3).train({
+    features: trainSet,
+    classProperty: 'class',
+    inputProperties: sentinel2.bandNames()
+  });
+
+  var cart = ee.Classifier.smileCart().train({
+    features: trainSet,
+    classProperty: 'class',
+    inputProperties: sentinel2.bandNames()
+  });
+
+  var gbm = ee.Classifier.smileGradientTreeBoost({
+    numberOfTrees: 50,
+    shrinkage: 0.1,
+    samplingRate: 0.8,
+    maxNodes: 32,
+    loss: 'LeastSquares',
+    seed: 42
+  }).train({
+    features: trainSet,
+    classProperty: 'class',
+    inputProperties: sentinel2.bandNames()
+  });
+
+  // Classify for testing accuracy
+  var rfTest = testSet.classify(rf);
+  var svmTest = testSet.classify(svm);
+  var knnTest = testSet.classify(knn);
+  var cartTest = testSet.classify(cart);
+  var gbmTest = testSet.classify(gbm);
+
+  var mask = sentinel2.select(0).mask().clip(aoi).selfMask();
+
+  var rfImage = sentinel2.classify(rf).updateMask(mask).clip(aoi);
+  var svmImage = sentinel2.classify(svm).updateMask(mask).clip(aoi);
+  var knnImage = sentinel2.classify(knn).updateMask(mask).clip(aoi);
+  var cartImage = sentinel2.classify(cart).updateMask(mask).clip(aoi);
+  var gbmImage = sentinel2.classify(gbm).updateMask(mask).clip(aoi);
+
+  var palette = ['#0000ff', '#a52a2a', '#008000', '#cccccc', '#ffff00', '#ff00ff'];
+  Map.addLayer(rfImage, {min: 0, max: 5, palette: palette}, 'RF - ' + monthNames[index]);
+  Map.addLayer(svmImage, {min: 0, max: 5, palette: palette}, 'SVM - ' + monthNames[index]);
+  Map.addLayer(knnImage, {min: 0, max: 5, palette: palette}, 'KNN - ' + monthNames[index]);
+  Map.addLayer(cartImage, {min: 0, max: 5, palette: palette}, 'CART - ' + monthNames[index]);
+  Map.addLayer(gbmImage, {min: 0, max: 5, palette: palette}, 'GBM - ' + monthNames[index]);
+
+  // Accuracy in %
+  print(monthNames[index] + ' RF Accuracy (%):', rfTest.errorMatrix('class', 'classification').accuracy().multiply(100));
+  print(monthNames[index] + ' SVM Accuracy (%):', svmTest.errorMatrix('class', 'classification').accuracy().multiply(100));
+  print(monthNames[index] + ' KNN Accuracy (%):', knnTest.errorMatrix('class', 'classification').accuracy().multiply(100));
+  print(monthNames[index] + ' CART Accuracy (%):', cartTest.errorMatrix('class', 'classification').accuracy().multiply(100));
+  print(monthNames[index] + ' GBM Accuracy (%):', gbmTest.errorMatrix('class', 'classification').accuracy().multiply(100));
+
+  // EXPORT 
+  if (monthNames[index] === 'July') {
+    Export.image.toDrive({
+      image: gbmImage.toInt16(),
+      description: 'GBM_Classification_July',
+      folder: 'EarthEngineExports',
+      fileNamePrefix: 'GBM_Classification_July',
+      region: aoi,
+      scale: 10,
+      maxPixels: 1e13,
+      crs: 'EPSG:4326'
+    });
+  }
+});
+
+
+// ---- JUNE + JULY COMBINED ----
+
+var combinedStart = '2023-06-01';
+var combinedEnd = '2023-07-30';
+
+// Define palette for land cover classes
+var palette = ['#0000ff', '#a52a2a', '#008000', '#cccccc', '#ffff00', '#ff00ff'];
+
+// Prepare Sentinel-2 image for June + July
+var combinedS2 = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+  .filterBounds(aoi)
+  .filterDate(combinedStart, combinedEnd)
+  .filter(ee.Filter.lte("CLOUDY_PIXEL_PERCENTAGE", 30))
+  .select(['B2', 'B3', 'B4', 'B8', 'B11', 'B12'])
+  .median()
+  .clip(aoi);
+
+var combinedTraining = combinedS2.sampleRegions({
+  collection: trainingSamples,
+  properties: ['class'],
+  scale: 10
+});
+
+var combinedWithRandom = combinedTraining.randomColumn('random');
+var combinedTrain = combinedWithRandom.filter(ee.Filter.lt('random', 0.7));
+var combinedTest = combinedWithRandom.filter(ee.Filter.gte('random', 0.7));
+
+var rf = ee.Classifier.smileRandomForest(50).train({
+  features: combinedTrain,
+  classProperty: 'class',
+  inputProperties: combinedS2.bandNames()
+});
+
+var svm = ee.Classifier.libsvm().train({
+  features: combinedTrain,
+  classProperty: 'class',
+  inputProperties: combinedS2.bandNames()
+});
+
+var knn = ee.Classifier.smileKNN(3).train({
+  features: combinedTrain,
+  classProperty: 'class',
+  inputProperties: combinedS2.bandNames()
+});
+
+var cart = ee.Classifier.smileCart().train({
+  features: combinedTrain,
+  classProperty: 'class',
+  inputProperties: combinedS2.bandNames()
+});
+
+var gbm = ee.Classifier.smileGradientTreeBoost({
+  numberOfTrees: 50,
+  shrinkage: 0.1,
+  samplingRate: 0.8,
+  maxNodes: 32,
+  loss: 'LeastSquares',
+  seed: 42
+}).train({
+  features: combinedTrain,
+  classProperty: 'class',
+  inputProperties: combinedS2.bandNames()
+});
+
+var rfTest = combinedTest.classify(rf);
+var svmTest = combinedTest.classify(svm);
+var knnTest = combinedTest.classify(knn);
+var cartTest = combinedTest.classify(cart);
+var gbmTest = combinedTest.classify(gbm);
+
+var mask = combinedS2.select(0).mask().clip(aoi).selfMask();
+
+var rfImage = combinedS2.classify(rf).updateMask(mask).clip(aoi);
+var svmImage = combinedS2.classify(svm).updateMask(mask).clip(aoi);
+var knnImage = combinedS2.classify(knn).updateMask(mask).clip(aoi);
+var cartImage = combinedS2.classify(cart).updateMask(mask).clip(aoi);
+var gbmImage = combinedS2.classify(gbm).updateMask(mask).clip(aoi);
+
+// Add layers to map
+Map.addLayer(rfImage, {min: 0, max: 5, palette: palette}, 'RF - June+July');
+Map.addLayer(svmImage, {min: 0, max: 5, palette: palette}, 'SVM - June+July');
+Map.addLayer(knnImage, {min: 0, max: 5, palette: palette}, 'KNN - June+July');
+Map.addLayer(cartImage, {min: 0, max: 5, palette: palette}, 'CART - June+July');
+Map.addLayer(gbmImage, {min: 0, max: 5, palette: palette}, 'GBM - June+July');
+
+// Print accuracies
+print('June + July RF Accuracy (%):', rfTest.errorMatrix('class', 'classification').accuracy().multiply(100));
+print('June + July SVM Accuracy (%):', svmTest.errorMatrix('class', 'classification').accuracy().multiply(100));
+print('June + July KNN Accuracy (%):', knnTest.errorMatrix('class', 'classification').accuracy().multiply(100));
+print('June + July CART Accuracy (%):', cartTest.errorMatrix('class', 'classification').accuracy().multiply(100));
+print('June + July GBM Accuracy (%):', gbmTest.errorMatrix('class', 'classification').accuracy().multiply(100));
+
+
+// ---- JUNE + JULY + AUGUST COMBINED ----
+
+var combinedStart_JJA = '2023-06-01';
+var combinedEnd_JJA = '2023-08-31';
+
+// Define palette for land cover classes
+var palette = ['#0000ff', '#a52a2a', '#008000', '#cccccc', '#ffff00', '#ff00ff'];
+
+// Prepare Sentinel-2 image for June, July, and August
+var combinedS2_JJA = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+  .filterBounds(aoi)
+  .filterDate(combinedStart_JJA, combinedEnd_JJA)
+  .filter(ee.Filter.lte("CLOUDY_PIXEL_PERCENTAGE", 30))
+  .select(['B2', 'B3', 'B4', 'B8', 'B11', 'B12'])
+  .median()
+  .clip(aoi);
+
+// Sample training data
+var combinedTraining_JJA = combinedS2_JJA.sampleRegions({
+  collection: trainingSamples,
+  properties: ['class'],
+  scale: 10
+});
+
+// Split into training and testing sets
+var combinedWithRandom_JJA = combinedTraining_JJA.randomColumn('random');
+var combinedTrain_JJA = combinedWithRandom_JJA.filter(ee.Filter.lt('random', 0.7));
+var combinedTest_JJA = combinedWithRandom_JJA.filter(ee.Filter.gte('random', 0.7));
+
+// Train all classifiers
+var rf_JJA = ee.Classifier.smileRandomForest(50).train({
+  features: combinedTrain_JJA,
+  classProperty: 'class',
+  inputProperties: combinedS2_JJA.bandNames()
+});
+
+var svm_JJA = ee.Classifier.libsvm().train({
+  features: combinedTrain_JJA,
+  classProperty: 'class',
+  inputProperties: combinedS2_JJA.bandNames()
+});
+
+var knn_JJA = ee.Classifier.smileKNN(3).train({
+  features: combinedTrain_JJA,
+  classProperty: 'class',
+  inputProperties: combinedS2_JJA.bandNames()
+});
+
+var cart_JJA = ee.Classifier.smileCart().train({
+  features: combinedTrain_JJA,
+  classProperty: 'class',
+  inputProperties: combinedS2_JJA.bandNames()
+});
+
+var gbm_JJA = ee.Classifier.smileGradientTreeBoost({
+  numberOfTrees: 50,
+  shrinkage: 0.1,
+  samplingRate: 0.8,
+  maxNodes: 32,
+  loss: 'LeastSquares',
+  seed: 42
+}).train({
+  features: combinedTrain_JJA,
+  classProperty: 'class',
+  inputProperties: combinedS2_JJA.bandNames()
+});
+
+// Classify test set for accuracy
+var rfTest_JJA = combinedTest_JJA.classify(rf_JJA);
+var svmTest_JJA = combinedTest_JJA.classify(svm_JJA);
+var knnTest_JJA = combinedTest_JJA.classify(knn_JJA);
+var cartTest_JJA = combinedTest_JJA.classify(cart_JJA);
+var gbmTest_JJA = combinedTest_JJA.classify(gbm_JJA);
+
+// Apply mask and classify entire image
+var mask_JJA = combinedS2_JJA.select(0).mask().clip(aoi).selfMask();
+
+var rfImage_JJA = combinedS2_JJA.classify(rf_JJA).updateMask(mask_JJA).clip(aoi);
+var svmImage_JJA = combinedS2_JJA.classify(svm_JJA).updateMask(mask_JJA).clip(aoi);
+var knnImage_JJA = combinedS2_JJA.classify(knn_JJA).updateMask(mask_JJA).clip(aoi);
+var cartImage_JJA = combinedS2_JJA.classify(cart_JJA).updateMask(mask_JJA).clip(aoi);
+var gbmImage_JJA = combinedS2_JJA.classify(gbm_JJA).updateMask(mask_JJA).clip(aoi);
+
+// Add layers to map
+Map.addLayer(rfImage_JJA, {min: 0, max: 5, palette: palette}, 'RF - June+July+Aug');
+Map.addLayer(svmImage_JJA, {min: 0, max: 5, palette: palette}, 'SVM - June+July+Aug');
+Map.addLayer(knnImage_JJA, {min: 0, max: 5, palette: palette}, 'KNN - June+July+Aug');
+Map.addLayer(cartImage_JJA, {min: 0, max: 5, palette: palette}, 'CART - June+July+Aug');
+Map.addLayer(gbmImage_JJA, {min: 0, max: 5, palette: palette}, 'GBM - June+July+Aug');
+
+// Print accuracies in percentage
+print('June + July + August RF Accuracy (%):', rfTest_JJA.errorMatrix('class', 'classification').accuracy().multiply(100));
+print('June + July + August SVM Accuracy (%):', svmTest_JJA.errorMatrix('class', 'classification').accuracy().multiply(100));
+print('June + July + August KNN Accuracy (%):', knnTest_JJA.errorMatrix('class', 'classification').accuracy().multiply(100));
+print('June + July + August CART Accuracy (%):', cartTest_JJA.errorMatrix('class', 'classification').accuracy().multiply(100));
+print('June + July + August GBM Accuracy (%):', gbmTest_JJA.errorMatrix('class', 'classification').accuracy().multiply(100));
+
+
+// ---- JUNE + JULY + AUGUST + SEPTEMBER COMBINED ----
+
+var combinedStart_JJAS = '2023-06-01';
+var combinedEnd_JJAS = '2023-09-30';
+
+// Define palette for land cover classes
+var palette = ['#0000ff', '#a52a2a', '#008000', '#cccccc', '#ffff00', '#ff00ff'];
+
+// Prepare Sentinel-2 image for June, July, August, and September
+var combinedS2_JJAS = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+  .filterBounds(aoi)
+  .filterDate(combinedStart_JJAS, combinedEnd_JJAS)
+  .filter(ee.Filter.lte("CLOUDY_PIXEL_PERCENTAGE", 30))
+  .select(['B2', 'B3', 'B4', 'B8', 'B11', 'B12'])
+  .median()
+  .clip(aoi);
+
+// Sample training data
+var combinedTraining_JJAS = combinedS2_JJAS.sampleRegions({
+  collection: trainingSamples,
+  properties: ['class'],
+  scale: 10
+});
+
+// Split into training and testing sets
+var combinedWithRandom_JJAS = combinedTraining_JJAS.randomColumn('random');
+var combinedTrain_JJAS = combinedWithRandom_JJAS.filter(ee.Filter.lt('random', 0.7));
+var combinedTest_JJAS = combinedWithRandom_JJAS.filter(ee.Filter.gte('random', 0.7));
+
+// Train all classifiers
+var rf_JJAS = ee.Classifier.smileRandomForest(50).train({
+  features: combinedTrain_JJAS,
+  classProperty: 'class',
+  inputProperties: combinedS2_JJAS.bandNames()
+});
+
+var svm_JJAS = ee.Classifier.libsvm().train({
+  features: combinedTrain_JJAS,
+  classProperty: 'class',
+  inputProperties: combinedS2_JJAS.bandNames()
+});
+
+var knn_JJAS = ee.Classifier.smileKNN(3).train({
+  features: combinedTrain_JJAS,
+  classProperty: 'class',
+  inputProperties: combinedS2_JJAS.bandNames()
+});
+
+var cart_JJAS = ee.Classifier.smileCart().train({
+  features: combinedTrain_JJAS,
+  classProperty: 'class',
+  inputProperties: combinedS2_JJAS.bandNames()
+});
+
+var gbm_JJAS = ee.Classifier.smileGradientTreeBoost({
+  numberOfTrees: 50,
+  shrinkage: 0.1,
+  samplingRate: 0.8,
+  maxNodes: 32,
+  loss: 'LeastSquares',
+  seed: 42
+}).train({
+  features: combinedTrain_JJAS,
+  classProperty: 'class',
+  inputProperties: combinedS2_JJAS.bandNames()
+});
+
+// Classify test set for accuracy
+var rfTest_JJAS = combinedTest_JJAS.classify(rf_JJAS);
+var svmTest_JJAS = combinedTest_JJAS.classify(svm_JJAS);
+var knnTest_JJAS = combinedTest_JJAS.classify(knn_JJAS);
+var cartTest_JJAS = combinedTest_JJAS.classify(cart_JJAS);
+var gbmTest_JJAS = combinedTest_JJAS.classify(gbm_JJAS);
+
+// Apply mask and classify entire image
+var mask_JJAS = combinedS2_JJAS.select(0).mask().clip(aoi).selfMask();
+
+var rfImage_JJAS = combinedS2_JJAS.classify(rf_JJAS).updateMask(mask_JJAS).clip(aoi);
+var svmImage_JJAS = combinedS2_JJAS.classify(svm_JJAS).updateMask(mask_JJAS).clip(aoi);
+var knnImage_JJAS = combinedS2_JJAS.classify(knn_JJAS).updateMask(mask_JJAS).clip(aoi);
+var cartImage_JJAS = combinedS2_JJAS.classify(cart_JJAS).updateMask(mask_JJAS).clip(aoi);
+var gbmImage_JJAS = combinedS2_JJAS.classify(gbm_JJAS).updateMask(mask_JJAS).clip(aoi);
+
+// Add layers to map
+Map.addLayer(rfImage_JJAS, {min: 0, max: 5, palette: palette}, 'RF - June+July+Aug+Sept');
+Map.addLayer(svmImage_JJAS, {min: 0, max: 5, palette: palette}, 'SVM - June+July+Aug+Sept');
+Map.addLayer(knnImage_JJAS, {min: 0, max: 5, palette: palette}, 'KNN - June+July+Aug+Sept');
+Map.addLayer(cartImage_JJAS, {min: 0, max: 5, palette: palette}, 'CART - June+July+Aug+Sept');
+Map.addLayer(gbmImage_JJAS, {min: 0, max: 5, palette: palette}, 'GBM - June+July+Aug+Sept');
+
+// Print accuracies in percentage
+print('June + July + August + September RF Accuracy (%):', rfTest_JJAS.errorMatrix('class', 'classification').accuracy().multiply(100));
+print('June + July + August + September SVM Accuracy (%):', svmTest_JJAS.errorMatrix('class', 'classification').accuracy().multiply(100));
+print('June + July + August + September KNN Accuracy (%):', knnTest_JJAS.errorMatrix('class', 'classification').accuracy().multiply(100));
+print('June + July + August + September CART Accuracy (%):', cartTest_JJAS.errorMatrix('class', 'classification').accuracy().multiply(100));
+print('June + July + August + September GBM Accuracy (%):', gbmTest_JJAS.errorMatrix('class', 'classification').accuracy().multiply(100));
+
+
+//---- JUNE to OCTOBER COMBINED ----
+
+var combinedStart_JJASO = '2023-06-01';
+var combinedEnd_JJASO = '2023-10-31';
+
+// Define palette for land cover classes
+var palette = ['#0000ff', '#a52a2a', '#008000', '#cccccc', '#ffff00', '#ff00ff'];
+
+// Prepare Sentinel-2 image for June–October
+var combinedS2_JJASO = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+  .filterBounds(aoi)
+  .filterDate(combinedStart_JJASO, combinedEnd_JJASO)
+  .filter(ee.Filter.lte("CLOUDY_PIXEL_PERCENTAGE", 30))
+  .select(['B2', 'B3', 'B4', 'B8', 'B11', 'B12'])
+  .median()
+  .clip(aoi);
+
+// Sample training data
+var combinedTraining_JJASO = combinedS2_JJASO.sampleRegions({
+  collection: trainingSamples,
+  properties: ['class'],
+  scale: 10
+});
+
+// Split into training and testing sets
+var combinedWithRandom_JJASO = combinedTraining_JJASO.randomColumn('random');
+var combinedTrain_JJASO = combinedWithRandom_JJASO.filter(ee.Filter.lt('random', 0.7));
+var combinedTest_JJASO = combinedWithRandom_JJASO.filter(ee.Filter.gte('random', 0.7));
+
+// Train all classifiers
+var rf_JJASO = ee.Classifier.smileRandomForest(50).train({
+  features: combinedTrain_JJASO,
+  classProperty: 'class',
+  inputProperties: combinedS2_JJASO.bandNames()
+});
+
+var svm_JJASO = ee.Classifier.libsvm().train({
+  features: combinedTrain_JJASO,
+  classProperty: 'class',
+  inputProperties: combinedS2_JJASO.bandNames()
+});
+
+var knn_JJASO = ee.Classifier.smileKNN(3).train({
+  features: combinedTrain_JJASO,
+  classProperty: 'class',
+  inputProperties: combinedS2_JJASO.bandNames()
+});
+
+var cart_JJASO = ee.Classifier.smileCart().train({
+  features: combinedTrain_JJASO,
+  classProperty: 'class',
+  inputProperties: combinedS2_JJASO.bandNames()
+});
+
+var gbm_JJASO = ee.Classifier.smileGradientTreeBoost({
+  numberOfTrees: 50,
+  shrinkage: 0.1,
+  samplingRate: 0.8,
+  maxNodes: 32,
+  loss: 'LeastSquares',
+  seed: 42
+}).train({
+  features: combinedTrain_JJASO,
+  classProperty: 'class',
+  inputProperties: combinedS2_JJASO.bandNames()
+});
+
+// Classify test set for accuracy
+var rfTest_JJASO = combinedTest_JJASO.classify(rf_JJASO);
+var svmTest_JJASO = combinedTest_JJASO.classify(svm_JJASO);
+var knnTest_JJASO = combinedTest_JJASO.classify(knn_JJASO);
+var cartTest_JJASO = combinedTest_JJASO.classify(cart_JJASO);
+var gbmTest_JJASO = combinedTest_JJASO.classify(gbm_JJASO);
+
+// Apply mask and classify entire image
+var mask_JJASO = combinedS2_JJASO.select(0).mask().clip(aoi).selfMask();
+
+var rfImage_JJASO = combinedS2_JJASO.classify(rf_JJASO).updateMask(mask_JJASO).clip(aoi);
+var svmImage_JJASO = combinedS2_JJASO.classify(svm_JJASO).updateMask(mask_JJASO).clip(aoi);
+var knnImage_JJASO = combinedS2_JJASO.classify(knn_JJASO).updateMask(mask_JJASO).clip(aoi);
+var cartImage_JJASO = combinedS2_JJASO.classify(cart_JJASO).updateMask(mask_JJASO).clip(aoi);
+var gbmImage_JJASO = combinedS2_JJASO.classify(gbm_JJASO).updateMask(mask_JJASO).clip(aoi);
+
+// ---- Accuracy printing ----
+print('June to October RF Accuracy (%):', rfTest_JJASO.errorMatrix('class', 'classification').accuracy().multiply(100));
+print('June to October SVM Accuracy (%):', svmTest_JJASO.errorMatrix('class', 'classification').accuracy().multiply(100));
+print('June to October KNN Accuracy (%):', knnTest_JJASO.errorMatrix('class', 'classification').accuracy().multiply(100));
+print('June to October CART Accuracy (%):', cartTest_JJASO.errorMatrix('class', 'classification').accuracy().multiply(100));
+print('June to October GBM Accuracy (%):', gbmTest_JJASO.errorMatrix('class', 'classification').accuracy().multiply(100));
+
+//---- Add Layers 
+Map.addLayer(rfImage_JJASO, {min: 0, max: 5, palette: palette}, 'RF - June to Oct');
+Map.addLayer(svmImage_JJASO, {min: 0, max: 5, palette: palette}, 'SVM - June to Oct');
+Map.addLayer(knnImage_JJASO, {min: 0, max: 5, palette: palette}, 'KNN - June to Oct');
+Map.addLayer(cartImage_JJASO, {min: 0, max: 5, palette: palette}, 'CART - June to Oct');
+Map.addLayer(gbmImage_JJASO, {min: 0, max: 5, palette: palette}, 'GBM - June to Oct');
+
+// ---- AREA CALCULATION ----
+
+// Pixel area image (each pixel is ~10m x 10m = 100 m²)
+var pixelArea = ee.Image.pixelArea();  // in square meters
+
+// Mask rice class (class 4) and sugarcane class (class 5)
+var riceMask = rfImage_JJASO.eq(4);       // Rice class
+var sugarcaneMask = rfImage_JJASO.eq(5);   // Sugarcane class
+
+// Calculate rice area
+var riceAreaImage = riceMask.multiply(pixelArea); // area image for rice
+var riceArea = riceAreaImage.reduceRegion({
+  reducer: ee.Reducer.sum(),
+  geometry: aoi,
+  scale: 10,
+  maxPixels: 1e13
+}).get('classification');
+
+// Calculate sugarcane area
+var sugarcaneAreaImage = sugarcaneMask.multiply(pixelArea); // area image for sugarcane
+var sugarcaneArea = sugarcaneAreaImage.reduceRegion({
+  reducer: ee.Reducer.sum(),
+  geometry: aoi,
+  scale: 10,
+  maxPixels: 1e13
+}).get('classification');
+
+// Convert to hectares (1 hectare = 10,000 m²)
+var riceAreaHa = ee.Number(riceArea).divide(10000);
+var sugarcaneAreaHa = ee.Number(sugarcaneArea).divide(10000);
+
+// Print results
+print('Rice Area (hectares):', riceAreaHa);
+print('Sugarcane Area (hectares):', sugarcaneAreaHa);
+
+// ---- EXPORT----
+Export.image.toDrive({
+  image: rfImage_JJASO.toInt16(), // classified image is integer
+  description: 'Sentinel2_JuneOct_RF_Classification',
+  folder: 'EarthEngineExports',  // Optional - exports into this folder
+  fileNamePrefix: 'Sentinel2_JuneOct_RF_Classification',
+  region: aoi,
+  scale: 10,
+  crs: 'EPSG:4326',  // standard lat-lon projection
+  maxPixels: 1e13,
+  fileFormat: 'GeoTIFF'
+});
+
+
+// ---- SENTINEL 1 + 2 ----
+
+var months = ['06', '07', '08', '09', '10'];
+var monthNames = ['June', 'July', 'August', 'September', 'October'];
+
+months.forEach(function(month, index) {
+  var startDate = '2023-' + month + '-01';
+  var endDate = '2023-' + month + '-30';
+
+  // Sentinel-2
+  var sentinel2 = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+    .filterBounds(aoi)
+    .filterDate(startDate, endDate)
+    .filter(ee.Filter.lte("CLOUDY_PIXEL_PERCENTAGE", 30))
+    .select(['B2', 'B3', 'B4', 'B8', 'B11', 'B12'])
+    .median()
+    .clip(aoi);
+
+  // Sentinel-1
+  var sentinel1 = ee.ImageCollection('COPERNICUS/S1_GRD')
+    .filterBounds(aoi)
+    .filterDate(startDate, endDate)
+    .filter(ee.Filter.eq('instrumentMode', 'IW'))
+    .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VH'))
+    .select('VH')
+    .median()
+    .clip(aoi);
+
+  // Combine Sentinel-1 and Sentinel-2
+  var combined = sentinel2.addBands(sentinel1);
+
+  // Sample for training/testing
+  var training = combined.sampleRegions({
+    collection: trainingSamples,
+    properties: ['class'],
+    scale: 10
+  });
+
+  var withRandom = training.randomColumn('random');
+  var split = 0.7;
+  var trainSet = withRandom.filter(ee.Filter.lt('random', split));
+  var testSet = withRandom.filter(ee.Filter.gte('random', split));
+
+  // Train classifiers
+  var rf = ee.Classifier.smileRandomForest(50).train({
+    features: trainSet,
+    classProperty: 'class',
+    inputProperties: combined.bandNames()
+  });
+
+  var svm = ee.Classifier.libsvm().train({
+    features: trainSet,
+    classProperty: 'class',
+    inputProperties: combined.bandNames()
+  });
+
+  var knn = ee.Classifier.smileKNN(3).train({
+    features: trainSet,
+    classProperty: 'class',
+    inputProperties: combined.bandNames()
+  });
+
+  var cart = ee.Classifier.smileCart().train({
+    features: trainSet,
+    classProperty: 'class',
+    inputProperties: combined.bandNames()
+  });
+
+  var gbm = ee.Classifier.smileGradientTreeBoost({
+    numberOfTrees: 50,
+    shrinkage: 0.1,
+    samplingRate: 0.8,
+    maxNodes: 32,
+    loss: 'LeastSquares',
+    seed: 42
+  }).train({
+    features: trainSet,
+    classProperty: 'class',
+    inputProperties: combined.bandNames()
+  });
+
+  // Classify for testing accuracy
+  var rfTest = testSet.classify(rf);
+  var svmTest = testSet.classify(svm);
+  var knnTest = testSet.classify(knn);
+  var cartTest = testSet.classify(cart);
+  var gbmTest = testSet.classify(gbm);
+
+  // Mask based on valid data and AOI geometry
+  var mask = combined.select(0).mask().clip(aoi).selfMask();
+
+  // Apply classifier, mask, and clip
+  var rfImage = combined.classify(rf).updateMask(mask).clip(aoi);
+  var svmImage = combined.classify(svm).updateMask(mask).clip(aoi);
+  var knnImage = combined.classify(knn).updateMask(mask).clip(aoi);
+  var cartImage = combined.classify(cart).updateMask(mask).clip(aoi);
+  var gbmImage = combined.classify(gbm).updateMask(mask).clip(aoi);
+
+  // Visualization
+  var palette = ['#0000ff', '#a52a2a', '#008000', '#cccccc', '#ffff00', '#ff00ff'];
+  Map.addLayer(rfImage, {min: 0, max: 5, palette: palette}, 'SENTINEL 1+2 RF - ' + monthNames[index]);
+  Map.addLayer(svmImage, {min: 0, max: 5, palette: palette}, 'SENTINEL 1+2 SVM - ' + monthNames[index]);
+  Map.addLayer(knnImage, {min: 0, max: 5, palette: palette}, 'SENTINEL 1+2 KNN - ' + monthNames[index]);
+  Map.addLayer(cartImage, {min: 0, max: 5, palette: palette}, 'SENTINEL 1+2 CART - ' + monthNames[index]);
+  Map.addLayer(gbmImage, {min: 0, max: 5, palette: palette}, 'SENTINEL 1+2 GBM - ' + monthNames[index]);
+
+  // Accuracy check
+  print('SENTINEL 1+2 ' + monthNames[index] + ' RF Accuracy (%):', rfTest.errorMatrix('class', 'classification').accuracy().multiply(100));
+  print('SENTINEL 1+2 ' + monthNames[index] + ' SVM Accuracy (%):', svmTest.errorMatrix('class', 'classification').accuracy().multiply(100));
+  print('SENTINEL 1+2 ' + monthNames[index] + ' KNN Accuracy (%):', knnTest.errorMatrix('class', 'classification').accuracy().multiply(100));
+  print('SENTINEL 1+2 ' + monthNames[index] + ' CART Accuracy (%):', cartTest.errorMatrix('class', 'classification').accuracy().multiply(100));
+  print('SENTINEL 1+2 ' + monthNames[index] + ' GBM Accuracy (%):', gbmTest.errorMatrix('class', 'classification').accuracy().multiply(100));
+
+  // ---- AREA CALCULATION FOR RICE (class 4) and SUGARCANE (class 5) ----
+  var pixelArea = ee.Image.pixelArea();
+
+  var riceMask = rfImage.eq(4);
+  var sugarcaneMask = rfImage.eq(5);
+
+  var riceArea = pixelArea.updateMask(riceMask).rename('area')
+    .reduceRegion({
+      reducer: ee.Reducer.sum(),
+      geometry: aoi,
+      scale: 10,
+      maxPixels: 1e13
+    }).get('area');
+
+  var sugarcaneArea = pixelArea.updateMask(sugarcaneMask).rename('area')
+    .reduceRegion({
+      reducer: ee.Reducer.sum(),
+      geometry: aoi,
+      scale: 10,
+      maxPixels: 1e13
+    }).get('area');
+
+  var riceAreaHa = ee.Number(riceArea).divide(10000);
+  var sugarcaneAreaHa = ee.Number(sugarcaneArea).divide(10000);
+
+  print('SENTINEL 1+2 ' + monthNames[index] + ' Rice Area (ha):', riceAreaHa);
+  print('SENTINEL 1+2 ' + monthNames[index] + ' Sugarcane Area (ha):', sugarcaneAreaHa);
+
+  // ---- EXPORT GBM IMAGE FOR JULY ----
+  if (monthNames[index] === 'July') {
+    Export.image.toDrive({
+      image: gbmImage.toInt16(),
+      description: 'SENTINEL1_2_GBM_July',
+      folder: 'EarthEngineExports',
+      fileNamePrefix: 'SENTINEL1_2_GBM_July',
+      region: aoi,
+      scale: 10,
+      crs: 'EPSG:4326',
+      maxPixels: 1e13,
+      fileFormat: 'GeoTIFF'
+    });
+  }
+
+});
+
+
+// ---- SENTINEL 1+2 JUNE + JULY COMBINED ----
+
+var combinedStart = '2023-06-01';
+var combinedEnd = '2023-07-31';
+
+var palette = ['#0000ff', '#a52a2a', '#008000', '#cccccc', '#ffff00', '#ff00ff'];
+
+// Sentinel-2
+var sentinel2 = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+  .filterBounds(aoi)
+  .filterDate(combinedStart, combinedEnd)
+  .filter(ee.Filter.lte("CLOUDY_PIXEL_PERCENTAGE", 30))
+  .select(['B2', 'B3', 'B4', 'B8', 'B11', 'B12'])
+  .median()
+  .clip(aoi);
+
+// Sentinel-1
+var sentinel1 = ee.ImageCollection('COPERNICUS/S1_GRD')
+  .filterBounds(aoi)
+  .filterDate(combinedStart, combinedEnd)
+  .filter(ee.Filter.eq('instrumentMode', 'IW'))
+  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VH'))
+  .select('VH')
+  .median()
+  .clip(aoi);
+
+// Combine S1 + S2
+var combined = sentinel2.addBands(sentinel1);
+
+// Sample for training/testing
+var training = combined.sampleRegions({
+  collection: trainingSamples,
+  properties: ['class'],
+  scale: 10
+});
+
+var withRandom = training.randomColumn('random');
+var split = 0.7;
+var trainSet = withRandom.filter(ee.Filter.lt('random', split));
+var testSet = withRandom.filter(ee.Filter.gte('random', split));
+
+// Train classifiers
+var rf = ee.Classifier.smileRandomForest(50).train({
+  features: trainSet,
+  classProperty: 'class',
+  inputProperties: combined.bandNames()
+});
+
+var svm = ee.Classifier.libsvm().train({
+  features: trainSet,
+  classProperty: 'class',
+  inputProperties: combined.bandNames()
+});
+
+var knn = ee.Classifier.smileKNN(3).train({
+  features: trainSet,
+  classProperty: 'class',
+  inputProperties: combined.bandNames()
+});
+
+var cart = ee.Classifier.smileCart().train({
+  features: trainSet,
+  classProperty: 'class',
+  inputProperties: combined.bandNames()
+});
+
+var gbm = ee.Classifier.smileGradientTreeBoost({
+  numberOfTrees: 50,
+  shrinkage: 0.1,
+  samplingRate: 0.8,
+  maxNodes: 32,
+  loss: 'LeastSquares',
+  seed: 42
+}).train({
+  features: trainSet,
+  classProperty: 'class',
+  inputProperties: combined.bandNames()
+});
+
+// Classify test set for accuracy
+var rfTest = testSet.classify(rf);
+var svmTest = testSet.classify(svm);
+var knnTest = testSet.classify(knn);
+var cartTest = testSet.classify(cart);
+var gbmTest = testSet.classify(gbm);
+
+// Apply mask and classify entire image
+var mask = combined.select(0).mask().clip(aoi).selfMask();
+
+var rfImage = combined.classify(rf).updateMask(mask).clip(aoi);
+var svmImage = combined.classify(svm).updateMask(mask).clip(aoi);
+var knnImage = combined.classify(knn).updateMask(mask).clip(aoi);
+var cartImage = combined.classify(cart).updateMask(mask).clip(aoi);
+var gbmImage = combined.classify(gbm).updateMask(mask).clip(aoi);
+
+// Visualization
+Map.addLayer(rfImage, {min: 0, max: 5, palette: palette}, 'SENTINEL 1+2 RF - June+July');
+Map.addLayer(svmImage, {min: 0, max: 5, palette: palette}, 'SENTINEL 1+2 SVM - June+July');
+Map.addLayer(knnImage, {min: 0, max: 5, palette: palette}, 'SENTINEL 1+2 KNN - June+July');
+Map.addLayer(cartImage, {min: 0, max: 5, palette: palette}, 'SENTINEL 1+2 CART - June+July');
+Map.addLayer(gbmImage, {min: 0, max: 5, palette: palette}, 'SENTINEL 1+2 GBM - June+July');
+
+// Accuracy check
+print('SENTINEL 1+2 June+July RF Accuracy:', rfTest.errorMatrix('class', 'classification').accuracy().multiply(100));
+print('SENTINEL 1+2 June+July SVM Accuracy:', svmTest.errorMatrix('class', 'classification').accuracy().multiply(100));
+print('SENTINEL 1+2 June+July KNN Accuracy:', knnTest.errorMatrix('class', 'classification').accuracy().multiply(100));
+print('SENTINEL 1+2 June+July CART Accuracy:', cartTest.errorMatrix('class', 'classification').accuracy().multiply(100));
+print('SENTINEL 1+2 June+July GBM Accuracy:', gbmTest.errorMatrix('class', 'classification').accuracy().multiply(100));
+
+
+// ---- SENTINEL 1+2 JUNE + JULY + AUGUST COMBINED ----
+
+var combinedStart = '2023-06-01';
+var combinedEnd = '2023-08-31';
+
+var palette = ['#0000ff', '#a52a2a', '#008000', '#cccccc', '#ffff00', '#ff00ff'];
+
+// Sentinel-2
+var sentinel2 = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+  .filterBounds(aoi)
+  .filterDate(combinedStart, combinedEnd)
+  .filter(ee.Filter.lte("CLOUDY_PIXEL_PERCENTAGE", 30))
+  .select(['B2', 'B3', 'B4', 'B8', 'B11', 'B12'])
+  .median()
+  .clip(aoi);
+
+// Sentinel-1
+var sentinel1 = ee.ImageCollection('COPERNICUS/S1_GRD')
+  .filterBounds(aoi)
+  .filterDate(combinedStart, combinedEnd)
+  .filter(ee.Filter.eq('instrumentMode', 'IW'))
+  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VH'))
+  .select('VH')
+  .median()
+  .clip(aoi);
+
+// Combine S1 + S2
+var combined = sentinel2.addBands(sentinel1);
+
+// Sample for training/testing
+var training = combined.sampleRegions({
+  collection: trainingSamples,
+  properties: ['class'],
+  scale: 10
+});
+
+var withRandom = training.randomColumn('random');
+var split = 0.7;
+var trainSet = withRandom.filter(ee.Filter.lt('random', split));
+var testSet = withRandom.filter(ee.Filter.gte('random', split));
+
+// Train classifiers
+var rf = ee.Classifier.smileRandomForest(50).train({
+  features: trainSet,
+  classProperty: 'class',
+  inputProperties: combined.bandNames()
+});
+
+var svm = ee.Classifier.libsvm().train({
+  features: trainSet,
+  classProperty: 'class',
+  inputProperties: combined.bandNames()
+});
+
+var knn = ee.Classifier.smileKNN(3).train({
+  features: trainSet,
+  classProperty: 'class',
+  inputProperties: combined.bandNames()
+});
+
+var cart = ee.Classifier.smileCart().train({
+  features: trainSet,
+  classProperty: 'class',
+  inputProperties: combined.bandNames()
+});
+
+var gbm = ee.Classifier.smileGradientTreeBoost({
+  numberOfTrees: 50,
+  shrinkage: 0.1,
+  samplingRate: 0.8,
+  maxNodes: 32,
+  loss: 'LeastSquares',
+  seed: 42
+}).train({
+  features: trainSet,
+  classProperty: 'class',
+  inputProperties: combined.bandNames()
+});
+
+// Classify test set for accuracy
+var rfTest = testSet.classify(rf);
+var svmTest = testSet.classify(svm);
+var knnTest = testSet.classify(knn);
+var cartTest = testSet.classify(cart);
+var gbmTest = testSet.classify(gbm);
+
+// Apply mask and classify entire image
+var mask = combined.select(0).mask().clip(aoi).selfMask();
+
+var rfImage = combined.classify(rf).updateMask(mask).clip(aoi);
+var svmImage = combined.classify(svm).updateMask(mask).clip(aoi);
+var knnImage = combined.classify(knn).updateMask(mask).clip(aoi);
+var cartImage = combined.classify(cart).updateMask(mask).clip(aoi);
+var gbmImage = combined.classify(gbm).updateMask(mask).clip(aoi);
+
+// Visualization
+Map.addLayer(rfImage, {min: 0, max: 5, palette: palette}, 'SENTINEL 1+2 RF - June+July+August');
+Map.addLayer(svmImage, {min: 0, max: 5, palette: palette}, 'SENTINEL 1+2 SVM - June+July+August');
+Map.addLayer(knnImage, {min: 0, max: 5, palette: palette}, 'SENTINEL 1+2 KNN - June+July+August');
+Map.addLayer(cartImage, {min: 0, max: 5, palette: palette}, 'SENTINEL 1+2 CART - June+July+August');
+Map.addLayer(gbmImage, {min: 0, max: 5, palette: palette}, 'SENTINEL 1+2 GBM - June+July+August');
+
+// Accuracy check
+print('SENTINEL 1+2 June+July+August RF Accuracy:', rfTest.errorMatrix('class', 'classification').accuracy().multiply(100));
+print('SENTINEL 1+2 June+July+August SVM Accuracy:', svmTest.errorMatrix('class', 'classification').accuracy().multiply(100));
+print('SENTINEL 1+2 June+July+August KNN Accuracy:', knnTest.errorMatrix('class', 'classification').accuracy().multiply(100));
+print('SENTINEL 1+2 June+July+August CART Accuracy:', cartTest.errorMatrix('class', 'classification').accuracy().multiply(100));
+print('SENTINEL 1+2 June+July+August GBM Accuracy:', gbmTest.errorMatrix('class', 'classification').accuracy().multiply(100));
+
+// ---- SENTINEL 1+2 JUNE + JULY + AUGUST + SEPTEMBER COMBINED ----
+
+var combinedStart = '2023-06-01';
+var combinedEnd = '2023-09-30';
+
+var palette = ['#0000ff', '#a52a2a', '#008000', '#cccccc', '#ffff00', '#ff00ff'];
+
+// Sentinel-2
+var sentinel2 = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+  .filterBounds(aoi)
+  .filterDate(combinedStart, combinedEnd)
+  .filter(ee.Filter.lte("CLOUDY_PIXEL_PERCENTAGE", 30))
+  .select(['B2', 'B3', 'B4', 'B8', 'B11', 'B12'])
+  .median()
+  .clip(aoi);
+
+// Sentinel-1
+var sentinel1 = ee.ImageCollection('COPERNICUS/S1_GRD')
+  .filterBounds(aoi)
+  .filterDate(combinedStart, combinedEnd)
+  .filter(ee.Filter.eq('instrumentMode', 'IW'))
+  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VH'))
+  .select('VH')
+  .median()
+  .clip(aoi);
+
+// Combine S1 + S2
+var combined = sentinel2.addBands(sentinel1);
+
+// Sample for training/testing
+var training = combined.sampleRegions({
+  collection: trainingSamples,
+  properties: ['class'],
+  scale: 10
+});
+
+var withRandom = training.randomColumn('random');
+var split = 0.7;
+var trainSet = withRandom.filter(ee.Filter.lt('random', split));
+var testSet = withRandom.filter(ee.Filter.gte('random', split));
+
+// Train classifiers
+var rf = ee.Classifier.smileRandomForest(50).train({
+  features: trainSet,
+  classProperty: 'class',
+  inputProperties: combined.bandNames()
+});
+
+var svm = ee.Classifier.libsvm().train({
+  features: trainSet,
+  classProperty: 'class',
+  inputProperties: combined.bandNames()
+});
+
+var knn = ee.Classifier.smileKNN(3).train({
+  features: trainSet,
+  classProperty: 'class',
+  inputProperties: combined.bandNames()
+});
+
+var cart = ee.Classifier.smileCart().train({
+  features: trainSet,
+  classProperty: 'class',
+  inputProperties: combined.bandNames()
+});
+
+var gbm = ee.Classifier.smileGradientTreeBoost({
+  numberOfTrees: 50,
+  shrinkage: 0.1,
+  samplingRate: 0.8,
+  maxNodes: 32,
+  loss: 'LeastSquares',
+  seed: 42
+}).train({
+  features: trainSet,
+  classProperty: 'class',
+  inputProperties: combined.bandNames()
+});
+
+// Classify test set for accuracy
+var rfTest = testSet.classify(rf);
+var svmTest = testSet.classify(svm);
+var knnTest = testSet.classify(knn);
+var cartTest = testSet.classify(cart);
+var gbmTest = testSet.classify(gbm);
+
+// Apply mask and classify entire image
+var mask = combined.select(0).mask().clip(aoi).selfMask();
+
+var rfImage = combined.classify(rf).updateMask(mask).clip(aoi);
+var svmImage = combined.classify(svm).updateMask(mask).clip(aoi);
+var knnImage = combined.classify(knn).updateMask(mask).clip(aoi);
+var cartImage = combined.classify(cart).updateMask(mask).clip(aoi);
+var gbmImage = combined.classify(gbm).updateMask(mask).clip(aoi);
+
+// Visualization
+Map.addLayer(rfImage, {min: 0, max: 5, palette: palette}, 'SENTINEL 1+2 RF - June+July+August+September');
+Map.addLayer(svmImage, {min: 0, max: 5, palette: palette}, 'SENTINEL 1+2 SVM - June+July+August+September');
+Map.addLayer(knnImage, {min: 0, max: 5, palette: palette}, 'SENTINEL 1+2 KNN - June+July+August+September');
+Map.addLayer(cartImage, {min: 0, max: 5, palette: palette}, 'SENTINEL 1+2 CART - June+July+August+September');
+Map.addLayer(gbmImage, {min: 0, max: 5, palette: palette}, 'SENTINEL 1+2 GBM - June+July+August+September');
+
+// Accuracy check
+print('SENTINEL 1+2 June+July+August+September RF Accuracy:', rfTest.errorMatrix('class', 'classification').accuracy().multiply(100));
+print('SENTINEL 1+2 June+July+August+September SVM Accuracy:', svmTest.errorMatrix('class', 'classification').accuracy().multiply(100));
+print('SENTINEL 1+2 June+July+August+September KNN Accuracy:', knnTest.errorMatrix('class', 'classification').accuracy().multiply(100));
+print('SENTINEL 1+2 June+July+August+September CART Accuracy:', cartTest.errorMatrix('class', 'classification').accuracy().multiply(100));
+print('SENTINEL 1+2 June+July+August+September GBM Accuracy:', gbmTest.errorMatrix('class', 'classification').accuracy().multiply(100));
+
+
+//---- SENTINEL 1+2 (June to October Combined) ----
+
+var combinedStart = '2023-06-01';
+var combinedEnd = '2023-10-31';
+
+// Define palette
+var palette = ['#0000ff', '#a52a2a', '#008000', '#cccccc', '#ffff00', '#ff00ff'];
+
+// Load Sentinel-2 imagery
+var sentinel2 = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+  .filterBounds(aoi)
+  .filterDate(combinedStart, combinedEnd)
+  .filter(ee.Filter.lte('CLOUDY_PIXEL_PERCENTAGE', 30))
+  .select(['B2', 'B3', 'B4', 'B8', 'B11', 'B12'])
+  .median()
+  .clip(aoi);
+
+// Load Sentinel-1 imagery
+var sentinel1 = ee.ImageCollection('COPERNICUS/S1_GRD')
+  .filterBounds(aoi)
+  .filterDate(combinedStart, combinedEnd)
+  .filter(ee.Filter.eq('instrumentMode', 'IW'))
+  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VH'))
+  .select('VH')
+  .median()
+  .clip(aoi);
+
+// Combine Sentinel-1 + Sentinel-2 bands
+var combined = sentinel2.addBands(sentinel1);
+
+// Prepare training data
+var training = combined.sampleRegions({
+  collection: trainingSamples,
+  properties: ['class'],
+  scale: 10,
+  geometries: true
+});
+
+// Split into training and testing sets
+var withRandom = training.randomColumn('random');
+var split = 0.7;
+var trainSet = withRandom.filter(ee.Filter.lt('random', split));
+var testSet = withRandom.filter(ee.Filter.gte('random', split));
+
+// ---- Train Classifiers ----
+var rf = ee.Classifier.smileRandomForest(50).train({
+  features: trainSet,
+  classProperty: 'class',
+  inputProperties: combined.bandNames()
+});
+
+var svm = ee.Classifier.libsvm().train({
+  features: trainSet,
+  classProperty: 'class',
+  inputProperties: combined.bandNames()
+});
+
+var knn = ee.Classifier.smileKNN(3).train({
+  features: trainSet,
+  classProperty: 'class',
+  inputProperties: combined.bandNames()
+});
+
+var cart = ee.Classifier.smileCart().train({
+  features: trainSet,
+  classProperty: 'class',
+  inputProperties: combined.bandNames()
+});
+
+var gbm = ee.Classifier.smileGradientTreeBoost({
+  numberOfTrees: 50,
+  shrinkage: 0.1,
+  samplingRate: 0.8,
+  maxNodes: 32,
+  loss: 'LeastSquares',
+  seed: 42
+}).train({
+  features: trainSet,
+  classProperty: 'class',
+  inputProperties: combined.bandNames()
+});
+
+// ---- Classify combined image ----
+var rfImage = combined.classify(rf).rename('rf');
+var svmImage = combined.classify(svm).rename('svm');
+var knnImage = combined.classify(knn).rename('knn');
+var cartImage = combined.classify(cart).rename('cart');
+var gbmImage = combined.classify(gbm).rename('gbm');
+
+// Stack all classified images
+var predictionStack = rfImage
+  .addBands(svmImage)
+  .addBands(knnImage)
+  .addBands(cartImage)
+  .addBands(gbmImage);
+
+// ---- ENSEMBLE MODE CLASSIFICATION ----
+var ensembleImage = predictionStack.reduce(ee.Reducer.mode()).rename('ensemble');
+
+// ---- Visualization ----
+Map.addLayer(rfImage, {min: 0, max: 5, palette: palette}, 'SENTINEL 1+2 RF - June to October');
+Map.addLayer(svmImage, {min: 0, max: 5, palette: palette}, 'SENTINEL 1+2 SVM - June to October');
+Map.addLayer(knnImage, {min: 0, max: 5, palette: palette}, 'SENTINEL 1+2 KNN - June to October');
+Map.addLayer(cartImage, {min: 0, max: 5, palette: palette}, 'SENTINEL 1+2 CART - June to October');
+Map.addLayer(gbmImage, {min: 0, max: 5, palette: palette}, 'SENTINEL 1+2 GBM - June to October');
+Map.addLayer(ensembleImage, {min: 0, max: 5, palette: palette}, 'Ensemble Classified Image');
+
+// ---- Accuracy Evaluation ----
+
+// Sample classified images at testSet locations
+var sampled = predictionStack.sampleRegions({
+  collection: testSet,
+  properties: ['class'], // ground-truth
+  scale: 10,
+  geometries: true
+});
+
+// Majority voting on sampled predictions
+var ensembleSamples = sampled.map(function(f) {
+  var votes = ee.List([
+    f.get('rf'),
+    f.get('svm'),
+    f.get('knn'),
+    f.get('cart'),
+    f.get('gbm')
+  ]);
+  var majorityVote = votes.reduce(ee.Reducer.mode());
+  return f.set('ensemble', majorityVote);
+});
+
+// Ensemble confusion matrix
+var confusionMatrix = ensembleSamples.errorMatrix('class', 'ensemble');
+var ensembleAccuracy = confusionMatrix.accuracy().multiply(100);
+
+// Print results
+print('Confusion Matrix (Ensemble):', confusionMatrix);
+print('Ensemble Accuracy (%):', ensembleAccuracy);
+
+// ---- Accuracy for individual classifiers ----
+var rfTest = testSet.classify(rf);
+var svmTest = testSet.classify(svm);
+var knnTest = testSet.classify(knn);
+var cartTest = testSet.classify(cart);
+var gbmTest = testSet.classify(gbm);
+
+print('RF Accuracy (%):', rfTest.errorMatrix('class', 'classification').accuracy().multiply(100));
+print('SVM Accuracy (%):', svmTest.errorMatrix('class', 'classification').accuracy().multiply(100));
+print('KNN Accuracy (%):', knnTest.errorMatrix('class', 'classification').accuracy().multiply(100));
+print('CART Accuracy (%):', cartTest.errorMatrix('class', 'classification').accuracy().multiply(100));
+print('GBM Accuracy (%):', gbmTest.errorMatrix('class', 'classification').accuracy().multiply(100));
+
+// ---- Export RF and Ensemble Images ----
+Export.image.toDrive({
+  image: rfImage.toInt16(),
+  description: 'SENTINEL1_2_RF_Classification_JuneOct',
+  folder: 'EarthEngineExports',
+  fileNamePrefix: 'SENTINEL1_2_RF_Classification_JuneOct',
+  region: aoi,
+  scale: 10,
+  crs: 'EPSG:4326',
+  maxPixels: 1e13,
+  fileFormat: 'GeoTIFF'
+});
+
+Export.image.toDrive({
+  image: ensembleImage.toInt16(),
+  description: 'SENTINEL1_2_Ensemble_Classification_JuneOct',
+  folder: 'EarthEngineExports',
+  fileNamePrefix: 'SENTINEL1_2_Ensemble_Classification_JuneOct',
+  region: aoi,
+  scale: 10,
+  crs: 'EPSG:4326',
+  maxPixels: 1e13,
+  fileFormat: 'GeoTIFF'
+});
